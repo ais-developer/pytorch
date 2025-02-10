@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import TYPE_CHECKING
 
-import torch
+from .quantizer import QuantizationAnnotation, Quantizer
 
-from torch.fx import Node
 
-from .quantizer import OperatorConfig, QuantizationAnnotation, Quantizer
+if TYPE_CHECKING:
+    import torch
+    from torch.fx import Node
 
 __all__ = [
     "ComposableQuantizer",
@@ -33,10 +34,10 @@ class ComposableQuantizer(Quantizer):
     ```
     """
 
-    def __init__(self, quantizers: List[Quantizer]):
+    def __init__(self, quantizers: list[Quantizer]):
         super().__init__()
         self.quantizers = quantizers
-        self._graph_annotations: Dict[Node, QuantizationAnnotation] = {}
+        self._graph_annotations: dict[Node, QuantizationAnnotation] = {}
 
     def _record_and_validate_annotations(
         self, gm: torch.fx.GraphModule, quantizer: Quantizer
@@ -67,9 +68,12 @@ class ComposableQuantizer(Quantizer):
             self._record_and_validate_annotations(model, quantizer)
         return model
 
+    def transform_for_annotation(
+        self, model: torch.fx.GraphModule
+    ) -> torch.fx.GraphModule:
+        for quantizer in self.quantizers:
+            model = quantizer.transform_for_annotation(model)
+        return model
+
     def validate(self, model: torch.fx.GraphModule) -> None:
         pass
-
-    @classmethod
-    def get_supported_operators(cls) -> List[OperatorConfig]:
-        return []

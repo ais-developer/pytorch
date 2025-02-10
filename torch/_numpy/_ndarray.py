@@ -1,8 +1,11 @@
+# mypy: ignore-errors
+
 from __future__ import annotations
 
 import builtins
 import math
 import operator
+from collections.abc import Sequence
 
 import torch
 
@@ -13,6 +16,7 @@ from ._normalizations import (
     normalizer,
     NotImplementedType,
 )
+
 
 newaxis = None
 
@@ -145,7 +149,7 @@ ri_dunder = {
     "mul": "multiply",
     "truediv": "divide",
     "floordiv": "floor_divide",
-    "pow": "float_power",
+    "pow": "power",
     "mod": "remainder",
     "and": "bitwise_and",
     "or": "bitwise_or",
@@ -164,6 +168,14 @@ def _upcast_int_indices(index):
         return tuple(_upcast_int_indices(i) for i in index)
     return index
 
+
+# Used to indicate that a parameter is unspecified (as opposed to explicitly
+# `None`)
+class _Unspecified:
+    pass
+
+
+_Unspecified.unspecified = _Unspecified()
 
 ###############################################################
 #                      ndarray class                          #
@@ -282,7 +294,17 @@ class ndarray:
         self.tensor.imag = asarray(value).tensor
 
     # ctors
-    def astype(self, dtype):
+    def astype(self, dtype, order="K", casting="unsafe", subok=True, copy=True):
+        if order != "K":
+            raise NotImplementedError(f"astype(..., order={order} is not implemented.")
+        if casting != "unsafe":
+            raise NotImplementedError(
+                f"astype(..., casting={casting} is not implemented."
+            )
+        if not subok:
+            raise NotImplementedError(f"astype(..., subok={subok} is not implemented.")
+        if not copy:
+            raise NotImplementedError(f"astype(..., copy={copy} is not implemented.")
         torch_dtype = _dtypes.dtype(dtype).torch_dtype
         t = self.tensor.to(torch_dtype)
         return ndarray(t)
@@ -296,15 +318,11 @@ class ndarray:
         return torch.flatten(self)
 
     def resize(self, *new_shape, refcheck=False):
-        a = self.tensor
-        # TODO(Lezcano) This is not done in-place
-        # implementation of ndarray.resize.
         # NB: differs from np.resize: fills with zeros instead of making repeated copies of input.
         if refcheck:
             raise NotImplementedError(
                 f"resize(..., refcheck={refcheck} is not implemented."
             )
-
         if new_shape in [(), (None,)]:
             return
 
@@ -314,22 +332,24 @@ class ndarray:
         if isinstance(new_shape, int):
             new_shape = (new_shape,)
 
-        a = a.flatten()
-
         if builtins.any(x < 0 for x in new_shape):
             raise ValueError("all elements of `new_shape` must be non-negative")
 
-        new_numel = math.prod(new_shape)
-        if new_numel < a.numel():
-            # shrink
-            ret = a[:new_numel].reshape(new_shape)
-        else:
-            b = torch.zeros(new_numel)
-            b[: a.numel()] = a
-            ret = b.reshape(new_shape)
-        self.tensor = ret
+        new_numel, old_numel = math.prod(new_shape), self.tensor.numel()
 
-    def view(self, dtype):
+        self.tensor.resize_(new_shape)
+
+        if new_numel >= old_numel:
+            # zero-fill new elements
+            assert self.tensor.is_contiguous()
+            b = self.tensor.flatten()  # does not copy
+            b[old_numel:].zero_()
+
+    def view(self, dtype=_Unspecified.unspecified, type=_Unspecified.unspecified):
+        if dtype is _Unspecified.unspecified:
+            dtype = self.dtype
+        if type is not _Unspecified.unspecified:
+            raise NotImplementedError(f"view(..., type={type} is not implemented.")
         torch_dtype = _dtypes.dtype(dtype).torch_dtype
         tview = self.tensor.view(torch_dtype)
         return ndarray(tview)
@@ -342,6 +362,9 @@ class ndarray:
 
     def tolist(self):
         return self.tensor.tolist()
+
+    def __iter__(self):
+        return (ndarray(x) for x in self.tensor.__iter__())
 
     def __str__(self):
         return (
@@ -366,10 +389,10 @@ class ndarray:
     def __index__(self):
         try:
             return operator.index(self.tensor.item())
-        except Exception:
+        except Exception as exc:
             raise TypeError(
                 "only integer scalar arrays can be converted to a scalar index"
-            )
+            ) from exc
 
     def __bool__(self):
         return bool(self.tensor)
@@ -422,15 +445,36 @@ class ndarray:
             return self.__getitem__(args)
 
     def __getitem__(self, index):
+        tensor = self.tensor
+
+        def neg_step(i, s):
+            if not (isinstance(s, slice) and s.step is not None and s.step < 0):
+                return s
+
+            nonlocal tensor
+            tensor = torch.flip(tensor, (i,))
+
+            # Account for the fact that a slice includes the start but not the end
+            assert isinstance(s.start, int) or s.start is None
+            assert isinstance(s.stop, int) or s.stop is None
+            start = s.stop + 1 if s.stop else None
+            stop = s.start + 1 if s.start else None
+
+            return slice(start, stop, -s.step)
+
+        if isinstance(index, Sequence):
+            index = type(index)(neg_step(i, s) for i, s in enumerate(index))
+        else:
+            index = neg_step(0, index)
         index = _util.ndarrays_to_tensors(index)
         index = _upcast_int_indices(index)
-        return ndarray(self.tensor.__getitem__(index))
+        return ndarray(tensor.__getitem__(index))
 
     def __setitem__(self, index, value):
         index = _util.ndarrays_to_tensors(index)
         index = _upcast_int_indices(index)
 
-        if type(value) not in _dtypes_impl.SCALAR_TYPES:
+        if not _dtypes_impl.is_scalar(value):
             value = normalize_array_like(value)
             value = _util.cast_if_needed(value, self.tensor.dtype)
 
@@ -447,7 +491,7 @@ class ndarray:
 
 
 def _tolist(obj):
-    """Recusrively convert tensors into lists."""
+    """Recursively convert tensors into lists."""
     a1 = []
     for elem in obj:
         if isinstance(elem, (list, tuple)):
@@ -480,15 +524,21 @@ def array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0, like=N
     ):
         return obj
 
-    # lists of ndarrays: [1, [2, 3], ndarray(4)] convert to lists of lists
     if isinstance(obj, (list, tuple)):
-        obj = _tolist(obj)
+        # FIXME and they have the same dtype, device, etc
+        if obj and all(isinstance(x, torch.Tensor) for x in obj):
+            # list of arrays: *under torch.Dynamo* these are FakeTensors
+            obj = torch.stack(obj)
+        else:
+            # XXX: remove tolist
+            # lists of ndarrays: [1, [2, 3], ndarray(4)] convert to lists of lists
+            obj = _tolist(obj)
 
     # is obj an ndarray already?
     if isinstance(obj, ndarray):
         obj = obj.tensor
 
-    # is a specific dtype requrested?
+    # is a specific dtype requested?
     torch_dtype = None
     if dtype is not None:
         torch_dtype = _dtypes.dtype(dtype).torch_dtype

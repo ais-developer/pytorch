@@ -1,3 +1,5 @@
+# mypy: ignore-errors
+
 """ "Normalize" arguments: convert array_likes to tensors, dtypes to torch dtypes and so on.
 """
 from __future__ import annotations
@@ -11,13 +13,14 @@ import torch
 
 from . import _dtypes, _dtypes_impl, _util
 
+
 ArrayLike = typing.TypeVar("ArrayLike")
 Scalar = typing.Union[int, float, complex, bool]
 ArrayLikeOrScalar = typing.Union[ArrayLike, Scalar]
 
 DTypeLike = typing.TypeVar("DTypeLike")
 AxisLike = typing.TypeVar("AxisLike")
-NDArray = typing.TypeVar("NDarray")
+NDArray = typing.TypeVar("NDArray")
 CastingModes = typing.TypeVar("CastingModes")
 KeepDims = typing.TypeVar("KeepDims")
 
@@ -47,9 +50,15 @@ def normalize_array_like(x, parm=None):
 
 
 def normalize_array_like_or_scalar(x, parm=None):
-    if type(x) in _dtypes_impl.SCALAR_TYPES:
+    if _dtypes_impl.is_scalar_or_symbolic(x):
         return x
     return normalize_array_like(x, parm)
+
+
+def normalize_optional_array_like_or_scalar(x, parm=None):
+    if x is None:
+        return None
+    return normalize_array_like_or_scalar(x, parm)
 
 
 def normalize_optional_array_like(x, parm=None):
@@ -100,8 +109,12 @@ def normalize_outarray(arg, parm=None):
     # almost normalize_ndarray, only return the array, not its tensor
     if arg is None:
         return arg
-
     from ._ndarray import ndarray
+
+    # Dynamo can pass torch tensors as out arguments,
+    # wrap it in an ndarray before processing
+    if isinstance(arg, torch.Tensor):
+        arg = ndarray(arg)
 
     if not isinstance(arg, ndarray):
         raise TypeError(f"'{parm.name}' must be an array")
@@ -118,9 +131,10 @@ def normalize_casting(arg, parm=None):
 
 normalizers = {
     "ArrayLike": normalize_array_like,
-    "Union[ArrayLike, Scalar]": normalize_array_like_or_scalar,
+    "ArrayLikeOrScalar": normalize_array_like_or_scalar,
     "Optional[ArrayLike]": normalize_optional_array_like,
     "Sequence[ArrayLike]": normalize_seq_array_like,
+    "Optional[ArrayLikeOrScalar]": normalize_optional_array_like_or_scalar,
     "Optional[NDArray]": normalize_ndarray,
     "Optional[OutArray]": normalize_outarray,
     "NDArray": normalize_ndarray,
@@ -132,7 +146,7 @@ normalizers = {
 
 
 def maybe_normalize(arg, parm):
-    """Normalize arg if a normalizer is registred."""
+    """Normalize arg if a normalizer is registered."""
     normalizer = normalizers.get(parm.annotation, None)
     return normalizer(arg, parm) if normalizer else arg
 
@@ -161,7 +175,7 @@ def maybe_copy_to(out, result, promote_scalar_result=False):
             maybe_copy_to(o, r, promote_scalar_result) for o, r in zip(out, result)
         )
     else:
-        raise AssertionError()  # We should never hit this path
+        raise AssertionError  # We should never hit this path
 
 
 def wrap_tensors(result):
@@ -193,6 +207,7 @@ def normalizer(_func=None, *, promote_scalar_result=False):
             sig = inspect.signature(func)
             params = sig.parameters
             first_param = next(iter(params.values()))
+
             # NumPy's API does not have positional args before variadic positional args
             if first_param.kind == inspect.Parameter.VAR_POSITIONAL:
                 args = [maybe_normalize(arg, first_param) for arg in args]
@@ -210,6 +225,7 @@ def normalizer(_func=None, *, promote_scalar_result=False):
                 name: maybe_normalize(arg, params[name]) if name in params else arg
                 for name, arg in kwds.items()
             }
+
             result = func(*args, **kwds)
 
             # keepdims

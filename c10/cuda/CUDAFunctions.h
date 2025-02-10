@@ -12,8 +12,7 @@
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAMacros.h>
 #include <cuda_runtime_api.h>
-namespace c10 {
-namespace cuda {
+namespace c10::cuda {
 
 // NB: In the past, we were inconsistent about whether or not this reported
 // an error if there were driver problems are not.  Based on experience
@@ -37,15 +36,15 @@ C10_CUDA_API void warn_or_error_on_sync();
 // Raw CUDA device management functions
 C10_CUDA_API cudaError_t GetDeviceCount(int* dev_count);
 
-C10_CUDA_API cudaError_t GetDevice(int* device);
+C10_CUDA_API cudaError_t GetDevice(DeviceIndex* device);
 
-C10_CUDA_API cudaError_t SetDevice(int device);
+C10_CUDA_API cudaError_t SetDevice(DeviceIndex device);
 
-C10_CUDA_API cudaError_t MaybeSetDevice(int device);
+C10_CUDA_API cudaError_t MaybeSetDevice(DeviceIndex device);
 
-C10_CUDA_API int ExchangeDevice(int device);
+C10_CUDA_API DeviceIndex ExchangeDevice(DeviceIndex device);
 
-C10_CUDA_API int MaybeExchangeDevice(int device);
+C10_CUDA_API DeviceIndex MaybeExchangeDevice(DeviceIndex device);
 
 C10_CUDA_API void SetTargetDevice();
 
@@ -74,13 +73,21 @@ C10_CUDA_API __inline__ WarningState& warning_state() {
   return warning_state_;
 }
 // the subsequent functions are defined in the header because for performance
-// reasons we want them to be inline
+// reasons we want them to be inline.
+// performs contiguous or 2D cudaMemcpy and synchronizes afterwards
+// if width_in_bytes is not -1, 2d copy is performed and all 2d params are
+// expected to be set to valid values, no additional checks are performed other
+// than by cuda call itself
 C10_CUDA_API void __inline__ memcpy_and_sync(
     void* dst,
     const void* src,
     int64_t nbytes,
     cudaMemcpyKind kind,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    int64_t width_in_bytes = -1,
+    int64_t src_pitch = -1,
+    int64_t dst_pitch = -1,
+    int64_t height = -1) {
   if (C10_UNLIKELY(
           warning_state().get_sync_debug_mode() != SyncDebugMode::L_DISABLED)) {
     warn_or_error_on_sync();
@@ -88,14 +95,20 @@ C10_CUDA_API void __inline__ memcpy_and_sync(
   const c10::impl::PyInterpreter* interp = c10::impl::GPUTrace::get_trace();
   if (C10_UNLIKELY(interp)) {
     (*interp)->trace_gpu_stream_synchronization(
-        reinterpret_cast<uintptr_t>(stream));
+        c10::kCUDA, reinterpret_cast<uintptr_t>(stream));
   }
+  if (width_in_bytes == -1) {
 #if defined(TORCH_HIP_VERSION) && (TORCH_HIP_VERSION >= 301)
-  C10_CUDA_CHECK(hipMemcpyWithStream(dst, src, nbytes, kind, stream));
+    C10_CUDA_CHECK(hipMemcpyWithStream(dst, src, nbytes, kind, stream));
 #else
-  C10_CUDA_CHECK(cudaMemcpyAsync(dst, src, nbytes, kind, stream));
-  C10_CUDA_CHECK(cudaStreamSynchronize(stream));
+    C10_CUDA_CHECK(cudaMemcpyAsync(dst, src, nbytes, kind, stream));
+    C10_CUDA_CHECK(cudaStreamSynchronize(stream));
 #endif
+  } else {
+    C10_CUDA_CHECK(cudaMemcpy2DAsync(
+        dst, dst_pitch, src, src_pitch, width_in_bytes, height, kind, stream));
+    C10_CUDA_CHECK(cudaStreamSynchronize(stream));
+  }
 }
 
 C10_CUDA_API void __inline__ stream_synchronize(cudaStream_t stream) {
@@ -106,13 +119,12 @@ C10_CUDA_API void __inline__ stream_synchronize(cudaStream_t stream) {
   const c10::impl::PyInterpreter* interp = c10::impl::GPUTrace::get_trace();
   if (C10_UNLIKELY(interp)) {
     (*interp)->trace_gpu_stream_synchronization(
-        reinterpret_cast<uintptr_t>(stream));
+        c10::kCUDA, reinterpret_cast<uintptr_t>(stream));
   }
   C10_CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
-C10_CUDA_API bool hasPrimaryContext(int64_t device_index);
-C10_CUDA_API c10::optional<int64_t> getDeviceIndexWithPrimaryContext();
+C10_CUDA_API bool hasPrimaryContext(DeviceIndex device_index);
+C10_CUDA_API std::optional<DeviceIndex> getDeviceIndexWithPrimaryContext();
 
-} // namespace cuda
-} // namespace c10
+} // namespace c10::cuda

@@ -2,6 +2,7 @@
 #include <ATen/core/Tensor.h>
 #include <ATen/Context.h>
 #include <ATen/Dispatch.h>
+#include <ATen/Dispatch_v2.h>
 #include <ATen/cuda/CachingHostAllocator.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAEvent.h>
@@ -19,22 +20,162 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAStream.h>
 
+// TODO(NS): Investigate why FP8 conversion intrinsics end up being slower
+#ifdef AT_USE_NV_CVT_INTRINSICS
+#include <cuda_fp8.h>
+#endif
+
 namespace at::native {
 
 void neg_kernel_cuda(TensorIteratorBase &iter);
 void conj_kernel_cuda(TensorIteratorBase &iter);
 
+void float16_copy_kernel_cuda(TensorIteratorBase &iter) {
+    gpu_kernel_nocast(iter, [] GPU_LAMBDA(float value) {
+        return static_cast<at::Half>(value);
+    });
+}
+
+void bfloat16_copy_kernel_cuda(TensorIteratorBase &iter) {
+    gpu_kernel_nocast(iter, [] GPU_LAMBDA(float value) {
+        return static_cast<at::BFloat16>(value);
+    });
+}
+
+void float8_copy_kernel_cuda(TensorIteratorBase &iter) {
+  ScalarType dtype = iter.dtype(0);
+  ScalarType other_dtype = iter.dtype(1);
+  if (dtype == kFloat8_e4m3fn) {
+    switch (other_dtype) {
+      case kFloat:
+         gpu_kernel_nocast(iter, [] GPU_LAMBDA(float value) {
+             return Float8_e4m3fn(value);
+         });
+         break;
+      case kHalf:
+         gpu_kernel_nocast(iter, [] GPU_LAMBDA(Half value) {
+             return Float8_e4m3fn(value);
+         });
+         break;
+      case kBFloat16:
+         gpu_kernel_nocast(iter, [] GPU_LAMBDA(BFloat16 value) {
+             return Float8_e4m3fn(value);
+         });
+         break;
+      default:
+        gpu_kernel(iter, [] GPU_LAMBDA(Float8_e4m3fn x) { return x; });
+        break;
+    }
+  } else if (dtype == kFloat8_e5m2) {
+    switch (other_dtype) {
+      case kFloat:
+         gpu_kernel_nocast(iter, [] GPU_LAMBDA(float value) {
+#ifdef AT_USE_NV_CVT_INTRINSICS
+             const auto x =  __nv_cvt_float_to_fp8(value, __NV_NOSAT, __NV_E5M2);
+             return Float8_e5m2(x, Float8_e5m2::from_bits());
+#else
+             return Float8_e5m2(value);
+#endif
+         });
+         break;
+      case kHalf:
+         gpu_kernel_nocast(iter, [] GPU_LAMBDA(Half value) {
+#ifdef AT_USE_NV_CVT_INTRINSICS
+             const auto x =  __nv_cvt_halfraw_to_fp8(static_cast<__half>(value), __NV_NOSAT, __NV_E5M2);
+             return Float8_e5m2(x, Float8_e5m2::from_bits());
+#else
+             return Float8_e5m2(value);
+#endif
+         });
+         break;
+      case kBFloat16:
+         gpu_kernel_nocast(iter, [] GPU_LAMBDA(BFloat16 value) {
+#ifdef AT_USE_NV_CVT_INTRINSICS
+             const auto x =  __nv_cvt_bfloat16raw_to_fp8(static_cast<__nv_bfloat16>(value), __NV_NOSAT, __NV_E5M2);
+             return Float8_e5m2(x, Float8_e5m2::from_bits());
+#else
+             return Float8_e5m2(value);
+#endif
+         });
+         break;
+      default:
+         gpu_kernel(iter, [] GPU_LAMBDA(Float8_e5m2 x) { return x; });
+         break;
+    }
+  } else if (dtype == kFloat8_e4m3fnuz) {
+    switch (other_dtype) {
+      case kFloat:
+         gpu_kernel_nocast(iter, [] GPU_LAMBDA(float value) {
+             return Float8_e4m3fnuz(value);
+         });
+         break;
+      case kHalf:
+         gpu_kernel_nocast(iter, [] GPU_LAMBDA(Half value) {
+             return Float8_e4m3fnuz(value);
+         });
+         break;
+      case kBFloat16:
+         gpu_kernel_nocast(iter, [] GPU_LAMBDA(BFloat16 value) {
+             return Float8_e4m3fnuz(value);
+         });
+         break;
+      default:
+        gpu_kernel(iter, [] GPU_LAMBDA(Float8_e4m3fnuz x) { return x; });
+        break;
+    }
+  } else if (dtype == kFloat8_e5m2fnuz) {
+    switch (other_dtype) {
+      case kFloat:
+         gpu_kernel_nocast(iter, [] GPU_LAMBDA(float value) {
+             return Float8_e5m2fnuz(value);
+         });
+         break;
+      case kHalf:
+         gpu_kernel_nocast(iter, [] GPU_LAMBDA(Half value) {
+             return Float8_e5m2fnuz(value);
+         });
+         break;
+      case kBFloat16:
+         gpu_kernel_nocast(iter, [] GPU_LAMBDA(BFloat16 value) {
+             return Float8_e5m2fnuz(value);
+         });
+         break;
+      default:
+         gpu_kernel(iter, [] GPU_LAMBDA(Float8_e5m2fnuz x) { return x; });
+         break;
+    }
+  } else {
+    TORCH_CHECK(false, "This supposed ot be called only for Float8 types");
+  }
+}
+
+// TODO: We probably can use the opaque type trick to avoid creating duplicate
+// kernels for equivalent bit lengths
 void direct_copy_kernel_cuda(TensorIteratorBase &iter) {
   ScalarType dtype = iter.dtype(0);
   if (isQIntType(dtype)) {
     AT_DISPATCH_QINT_TYPES(dtype, "copy_", [&] {
       gpu_kernel(iter, [] GPU_LAMBDA(scalar_t x) { return x; });
     });
-  } else {
-    AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND6(
-        kHalf, kBool, kBFloat16, kComplexHalf, kFloat8_e4m3fn, kFloat8_e5m2, dtype, "copy_", [&] {
-          gpu_kernel(iter, [] GPU_LAMBDA(scalar_t x) { return x; });
+  } else if (dtype == kFloat8_e5m2 || dtype == kFloat8_e4m3fn || dtype == kFloat8_e5m2fnuz || dtype == kFloat8_e4m3fnuz) {
+     float8_copy_kernel_cuda(iter);
+  } else if (iter.dtype(1) == kFloat && (dtype == kBFloat16 || dtype == kHalf)) {
+     if (dtype == kBFloat16) {
+       bfloat16_copy_kernel_cuda(iter);
+     } else {
+       float16_copy_kernel_cuda(iter);
+     }
+  } else if (isBitsType(dtype)) {
+    TORCH_CHECK(dtype == iter.dtype(1), "copy_() does not support casting "
+      "bits types to different bits types. Source dtype is ", iter.dtype(1), "target dtype is ", dtype);
+    AT_DISPATCH_BIT_TYPES(dtype, "copy_", [&] {
+      gpu_kernel_nocast(iter, [] GPU_LAMBDA(scalar_t x) { return x; });
     });
+  } else {
+    AT_DISPATCH_V2(
+        dtype, "copy_", AT_WRAP([&] {
+          gpu_kernel(iter, [] GPU_LAMBDA(scalar_t x) { return x; });
+    }), AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX), kHalf, kBool, kBFloat16, kComplexHalf, AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES));
   }
 }
 
@@ -131,6 +272,23 @@ void copy_device_to_device(TensorIterator& iter,
   AT_CUDA_CHECK(cudaGetLastError());
 }
 
+inline std::tuple<size_t, size_t, size_t, size_t> getCopyParameters(const TensorIteratorBase& iter) {
+  size_t element_size = iter.tensor(0).element_size();
+  if (iter.ndim() == 1) {
+    size_t width_in_bytes = element_size;
+    size_t src_pitch = iter.strides(1)[0];
+    size_t dst_pitch = iter.strides(0)[0];
+    size_t height = iter.shape()[0];
+    return std::make_tuple(width_in_bytes, src_pitch, dst_pitch, height);
+  } else {
+    size_t width_in_bytes = iter.shape()[0] * element_size;
+    size_t src_pitch = iter.strides(1)[1];
+    size_t dst_pitch = iter.strides(0)[1];
+    size_t height = iter.shape()[1];
+    return std::make_tuple(width_in_bytes, src_pitch, dst_pitch, height);
+  }
+}
+
 static bool copy_requires_temporaries(TensorIterator& iter, bool p2p_enabled) {
   Device dst_device = iter.device(0);
   Device src_device = iter.device(1);
@@ -148,11 +306,23 @@ static bool copy_requires_temporaries(TensorIterator& iter, bool p2p_enabled) {
   } else if (dst_device.is_cuda() && src_device.is_cuda()) {
     // Copies between GPUs can use the copy kernel if P2P is supported
     return !p2p_enabled;
-  } else {
-    // The remaining cases require temporaries. For example, this includes
-    // non-contiguous copies between CPU and GPU.
-    return true;
   }
+
+  //for cross-device copies we can use memcpy2d if conditions are satisfied
+  if (dst_device.is_cuda() != src_device.is_cuda() && same_dtype && iter.ndim() <= 2) {
+    // TensorIterator reorders strides so that the first one is the smallest
+
+    if (iter.ndim() == 1 || iter.has_contiguous_first_dim()) {
+      auto [width_in_bytes, src_pitch, dst_pitch, height] = getCopyParameters(iter);
+      if (src_pitch >= width_in_bytes && dst_pitch >= width_in_bytes) {
+          return false; // No need for temporaries
+      }
+    }
+  }
+
+  // The remaining cases require temporaries. For example, this includes
+  // non-contiguous copies between CPU and GPU.
+  return true;
 }
 
 static bool maybe_enable_p2p_access(Device dst_device, Device src_device) {
@@ -179,9 +349,11 @@ static void copy_kernel_cuda(TensorIterator& iter, bool non_blocking) {
     Tensor src_contig;
 
     // If non_blocking is true - type conversions are performed on the GPU
-    // for CPU-GPU copies, otherwise type conversions are performed on the CPU.
-    // Type conversions are performed on the src device for GPU-GPU copies.
-    if (iter.device_type(0) == kCUDA || non_blocking) {
+    // For blocking transfers conversions are performed on CPU to avoid allocating
+    // extra GPU memory
+    // for GPU-GPU transfers conversions are performed on the source device
+    auto conversion_device = non_blocking ? kCUDA : kCPU;
+    if (iter.device_type(1) == conversion_device) {
       dst_contig = dst.is_contiguous() ? dst : at::empty_like(dst, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
       src_contig = iter.tensor(1).to(iter.dtype(0)).expand_as(dst).contiguous();
     } else {
@@ -231,11 +403,28 @@ static void copy_kernel_cuda(TensorIterator& iter, bool non_blocking) {
 
   void* dst = iter.data_ptr(0);
   void* src = iter.data_ptr(1);
-  int64_t nbytes = iter.numel() * iter.element_size(0);
   CUDAStream stream = getCurrentCUDAStream();
 
+  int64_t nbytes = 0;
+  int64_t width_in_bytes = -1;
+  int64_t src_pitch = -1;
+  int64_t dst_pitch = -1;
+  int64_t height = -1;
+  if (iter.is_contiguous()) {
+    nbytes = iter.numel() * iter.element_size(0);
+  } else {
+    // the only non-contiguous iter situation that can happen here is
+    // acceptable for 2d copy, this has been vetted in requires_temporaries
+    std::tie(width_in_bytes, src_pitch, dst_pitch, height) = getCopyParameters(iter);
+  }
+
   if (non_blocking) {
-    AT_CUDA_CHECK(cudaMemcpyAsync(dst, src, nbytes, kind, stream));
+    if (width_in_bytes == -1) {
+      AT_CUDA_CHECK(cudaMemcpyAsync(dst, src, nbytes, kind, stream));
+    } else {
+      AT_CUDA_CHECK(cudaMemcpy2DAsync(dst, dst_pitch, src, src_pitch, width_in_bytes, height, kind, stream));
+    }
+
     // we use both the storage context and the tensor data pointer as the key
     // for the caching host allocator. This allows us to better attribute the
     // events to the original tensor allocation correctly. The cases we seek to
@@ -256,7 +445,7 @@ static void copy_kernel_cuda(TensorIterator& iter, bool non_blocking) {
     CachingHostAllocator_recordEvent(ptr, ctx, stream);
 
   } else {
-    at::cuda::memcpy_and_sync(dst, src, nbytes, kind, stream);
+    at::cuda::memcpy_and_sync(dst, src, nbytes, kind, stream, width_in_bytes, src_pitch, dst_pitch, height);
   }
 
   if (iter.tensor(0).is_conj() != iter.tensor(1).is_conj()) {
@@ -267,6 +456,6 @@ static void copy_kernel_cuda(TensorIterator& iter, bool non_blocking) {
   }
 }
 
-REGISTER_DISPATCH(copy_stub, &copy_kernel_cuda);
+REGISTER_DISPATCH(copy_stub, &copy_kernel_cuda)
 
 } // namespace at::native

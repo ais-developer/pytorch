@@ -1,12 +1,12 @@
 #define TORCH_ASSERT_NO_OPERATORS
 #include <ATen/native/cuda/IndexKernel.h>
 #include <ATen/native/IndexKernel.h>
-#include <c10/cuda/CUDADeviceAssertion.h>
 
+#include <array>
 #include <type_traits>
 #include <ATen/core/TensorBase.h>
 #include <ATen/Dispatch.h>
-#include <ATen/core/Array.h>
+#include <ATen/Dispatch_v2.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/cub.h>
 #include <ATen/cuda/detail/IndexUtils.cuh>
@@ -68,9 +68,9 @@ void gpu_index_kernel(TensorIteratorBase& iter, const IntArrayRef index_size, co
     return;
   }
 
-  auto sizes = at::detail::Array<int64_t, MAX_DIMS>(0);
-  auto strides = at::detail::Array<int64_t, MAX_DIMS>(0);
-  auto index_ptrs = at::detail::Array<char*, MAX_DIMS>(nullptr);
+  auto sizes = std::array<int64_t, MAX_DIMS>{};
+  auto strides = std::array<int64_t, MAX_DIMS>{};
+  auto index_ptrs = std::array<char*, MAX_DIMS>{};
   for (unsigned i = 0; i < num_indices; i++) {
     sizes[i] = index_size[i];
     strides[i] = index_stride[i];
@@ -193,11 +193,23 @@ void index_put_kernel_impl(TensorIterator& iter, const IntArrayRef index_size, c
   });
 }
 
-static void index_kernel(TensorIteratorBase& iter, const IntArrayRef index_size, const IntArrayRef index_stride) {
-  AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND4(kComplexHalf, kHalf, kBool, kBFloat16, iter.dtype(), "index_cuda", [&] {
-    using dtype = OpaqueType<sizeof(scalar_t)>;
-    index_kernel_impl<dtype>(iter, index_size, index_stride);
-  });
+static void index_kernel(
+    TensorIteratorBase& iter,
+    const IntArrayRef index_size,
+    const IntArrayRef index_stride) {
+  AT_DISPATCH_V2(
+      iter.dtype(),
+      "index_cuda",
+      AT_WRAP([&] {
+        using dtype = OpaqueType<sizeof(scalar_t)>;
+        index_kernel_impl<dtype>(iter, index_size, index_stride);
+      }),
+      AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX),
+      AT_EXPAND(AT_FLOAT8_TYPES),
+      kComplexHalf,
+      kHalf,
+      kBool,
+      kBFloat16);
 }
 
 static void index_fill_kernel(
@@ -235,10 +247,19 @@ static void index_copy_kernel(
 
 static void index_put_kernel(TensorIterator& iter, const IntArrayRef index_size, const IntArrayRef index_stride, const bool accumulate) {
   TORCH_CHECK(!accumulate, "index_put does not support accumulate=true");
-  AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND4(kComplexHalf, kHalf, kBool, kBFloat16, iter.dtype(), "index_put", [&] {
-    using dtype = OpaqueType<sizeof(scalar_t)>;
-    index_put_kernel_impl<dtype>(iter, index_size, index_stride);
-  });
+  AT_DISPATCH_V2(
+    iter.dtype(),
+    "index_put",
+    AT_WRAP([&] {
+      using dtype = OpaqueType<sizeof(scalar_t)>;
+      index_put_kernel_impl<dtype>(iter, index_size, index_stride);
+    }),
+    AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX),
+    AT_EXPAND(AT_FLOAT8_TYPES),
+    kComplexHalf,
+    kHalf,
+    kBool,
+    kBFloat16);
 }
 
 void index_put_kernel_quantized_cuda(TensorIterator& iter, const IntArrayRef index_size, const IntArrayRef index_stride, const bool accumulate, const double scale, const int zero_point) {
@@ -250,7 +271,14 @@ void index_put_kernel_quantized_cuda(TensorIterator& iter, const IntArrayRef ind
 
     gpu_index_kernel(iter, index_size, index_stride, [inv_scale, zero_point, qmin, qmax]C10_DEVICE(char* const out_data, const char* const in_data, const int64_t offset) {
       int64_t qvalue = static_cast<int64_t>(zero_point + nearbyintf(*(float*)in_data * inv_scale));
-      qvalue = std::clamp(qvalue, qmin, qmax);
+      // See https://github.com/pytorch/pytorch/issues/127666
+      // and https://github.com/pytorch/pytorch/issues/128253.
+      // hip-clang std::clamp __glibcxx_assert_fail host function when building on Fedora40/gcc14.
+      // The following replaces std::clamp(qvalue, qmin, qmax) and is a viable solution for
+      // both CUDA and ROCm since std::clamp and this replacement generates the same PTX.
+      // Using #ifdef USE_ROCM to differentiate caused Windows build failures.
+      // The replacement should generate the same PTX as std::clamp. See https://godbolt.org/z/Wde9KW3v4
+      qvalue = (qvalue < qmin) ? qmin : (qmax < qvalue) ? qmax : qvalue;
       *(scalar_t*)(out_data + offset) = static_cast<scalar_t>(qvalue);
     });
   });
@@ -334,7 +362,7 @@ void take_kernel(
     // Cannot use `OpaqueType`, as Tensor::data_ptr<OpaqueType<N>> is not implemented
     AT_DISPATCH_INDEX_TYPES(cuda::detail::canUse32BitIndexMath(input) ? ScalarType::Int : ScalarType::Long,
       "take_cuda_index", [&] {
-         const auto* __restrict__ indexed_ptr = input.template data_ptr<scalar_t>();
+         const auto* __restrict__ indexed_ptr = input.template const_data_ptr<scalar_t>();
          cuda_take_put_kernel<scalar_t, index_t>(iter, input,
             [indexed_ptr] __device__(scalar_t& iterated, const index_t offset) {
                iterated = indexed_ptr[offset];
@@ -348,11 +376,10 @@ namespace {
 __global__ void masked_scatter_size_check(
   const int64_t* const mask_exclusive_sum,
   const bool* const mask,
-  const int64_t srcSize,
-  TORCH_DSA_KERNEL_ARGS) {
+  const int64_t srcSize) {
   // Convert exclusive sum to inclusive sum
   const auto totalElements = *mask_exclusive_sum + *mask;
-  CUDA_KERNEL_ASSERT2(totalElements <= srcSize);
+  CUDA_KERNEL_ASSERT(totalElements <= srcSize);
 }
 
 } // anonymous namespace
@@ -373,15 +400,9 @@ void launch_masked_scatter_kernel(
 
   // Asynchronously check that the number of `1` elements present in the mask
   // must be <= the number of elements available in `src`.
-  TORCH_DSA_KERNEL_LAUNCH(
-      masked_scatter_size_check,
-      1,
-      1,
-      0,
-      at::cuda::getCurrentCUDAStream(),
-      &maskPrefixSum_data[mask_numel - 1],
-      &mask_data[mask_numel - 1],
-      srcSize);
+  masked_scatter_size_check<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
+      &maskPrefixSum_data[mask_numel - 1], &mask_data[mask_numel - 1], srcSize);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   // We are getting elements from `src` based on an offset from
   // `maskPrefixSum`, so that should be made contiguous too
@@ -393,7 +414,7 @@ void launch_masked_scatter_kernel(
       .resize_outputs(false)
       .add_output(self)
       .add_input(self)
-      .add_input(mask_cont)
+      .add_const_input(mask_cont)
       .add_input(maskPrefixSum)
       .build();
 
@@ -448,24 +469,32 @@ void flip_kernel(TensorIterator& iter, const bool quantized) {
       flip_kernel_impl<dtype>(iter);
     });
   } else {
-    AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND3(at::ScalarType::Half, at::ScalarType::Bool, at::ScalarType::BFloat16,
-                                           iter.dtype(), "flip_cuda",
-    [&] {
-      using dtype = OpaqueType<sizeof(scalar_t)>;
-      flip_kernel_impl<dtype>(iter);
-    });
+    AT_DISPATCH_V2(
+      iter.dtype(),
+      "flip_cuda",
+      AT_WRAP([&] {
+        using dtype = OpaqueType<sizeof(scalar_t)>;
+        flip_kernel_impl<dtype>(iter);
+      }),
+      AT_EXPAND(AT_ALL_TYPES_AND_COMPLEX),
+      AT_EXPAND(AT_FLOAT8_TYPES),
+      AT_EXPAND(AT_BAREBONES_UNSIGNED_TYPES),
+      kComplexHalf,
+      kHalf,
+      kBool,
+      kBFloat16);
   }
 }
 
 
-REGISTER_DISPATCH(index_stub, &index_kernel);
-REGISTER_DISPATCH(index_fill_stub, &index_fill_kernel);
-REGISTER_DISPATCH(index_copy_stub, &index_copy_kernel);
-REGISTER_DISPATCH(index_put_stub, &index_put_kernel);
-REGISTER_DISPATCH(put_stub, &put_kernel);
-REGISTER_DISPATCH(take_stub, &take_kernel);
-REGISTER_DISPATCH(flip_stub, &flip_kernel);
+REGISTER_DISPATCH(index_stub, &index_kernel)
+REGISTER_DISPATCH(index_fill_stub, &index_fill_kernel)
+REGISTER_DISPATCH(index_copy_stub, &index_copy_kernel)
+REGISTER_DISPATCH(index_put_stub, &index_put_kernel)
+REGISTER_DISPATCH(put_stub, &put_kernel)
+REGISTER_DISPATCH(take_stub, &take_kernel)
+REGISTER_DISPATCH(flip_stub, &flip_kernel)
 
-REGISTER_CUDA_DISPATCH(index_put_kernel_quantized_stub, &index_put_kernel_quantized_cuda);
+REGISTER_CUDA_DISPATCH(index_put_kernel_quantized_stub, &index_put_kernel_quantized_cuda)
 
 } // namespace at::native

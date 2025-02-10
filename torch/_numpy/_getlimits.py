@@ -1,4 +1,4 @@
-import contextlib
+# mypy: ignore-errors
 
 import torch
 
@@ -13,8 +13,3 @@ def finfo(dtyp):
 def iinfo(dtyp):
     torch_dtype = _dtypes.dtype(dtyp).torch_dtype
     return torch.iinfo(torch_dtype)
-
-
-@contextlib.contextmanager
-def errstate(*args, **kwds):
-    yield
