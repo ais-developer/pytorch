@@ -3,16 +3,13 @@
 set -ex
 
 install_ubuntu() {
-  # NVIDIA dockers for RC releases use tag names like `11.0-cudnn8-devel-ubuntu18.04-rc`,
+  # NVIDIA dockers for RC releases use tag names like `11.0-cudnn9-devel-ubuntu18.04-rc`,
   # for this case we will set UBUNTU_VERSION to `18.04-rc` so that the Dockerfile could
   # find the correct image. As a result, here we have to check for
   #   "$UBUNTU_VERSION" == "18.04"*
   # instead of
   #   "$UBUNTU_VERSION" == "18.04"
-  if [[ "$UBUNTU_VERSION" == "18.04"* ]]; then
-    cmake3="cmake=3.10*"
-    maybe_libiomp_dev="libiomp-dev"
-  elif [[ "$UBUNTU_VERSION" == "20.04"* ]]; then
+  if [[ "$UBUNTU_VERSION" == "20.04"* ]]; then
     cmake3="cmake=3.16*"
     maybe_libiomp_dev=""
   elif [[ "$UBUNTU_VERSION" == "22.04"* ]]; then
@@ -23,7 +20,9 @@ install_ubuntu() {
     maybe_libiomp_dev="libiomp-dev"
   fi
 
-  if [[ "$CLANG_VERSION" == 12 ]]; then
+  if [[ "$CLANG_VERSION" == 15 ]]; then
+    maybe_libomp_dev="libomp-15-dev"
+  elif [[ "$CLANG_VERSION" == 12 ]]; then
     maybe_libomp_dev="libomp-12-dev"
   elif [[ "$CLANG_VERSION" == 10 ]]; then
     maybe_libomp_dev="libomp-10-dev"
@@ -33,8 +32,12 @@ install_ubuntu() {
 
   # HACK: UCC testing relies on libnccl library from NVIDIA repo, and version 2.16 crashes
   # See https://github.com/pytorch/pytorch/pull/105260#issuecomment-1673399729
+  # TODO: Eliminate this hack, we should not relay on apt-get installation
+  # See https://github.com/pytorch/pytorch/issues/144768
   if [[ "$UBUNTU_VERSION" == "20.04"* && "$CUDA_VERSION" == "11.8"* ]]; then
     maybe_libnccl_dev="libnccl2=2.15.5-1+cuda11.8 libnccl-dev=2.15.5-1+cuda11.8 --allow-downgrades --allow-change-held-packages"
+  elif [[ "$UBUNTU_VERSION" == "20.04"* && "$CUDA_VERSION" == "12.4"* ]]; then
+    maybe_libnccl_dev="libnccl2=2.25.1-1+cuda12.4 libnccl-dev=2.25.1-1+cuda12.4 --allow-downgrades --allow-change-held-packages"
   else
     maybe_libnccl_dev=""
   fi
@@ -62,6 +65,7 @@ install_ubuntu() {
     ${maybe_libiomp_dev} \
     libyaml-dev \
     libz-dev \
+    libjemalloc2 \
     libjpeg-dev \
     libasound2-dev \
     libsndfile-dev \
@@ -75,7 +79,9 @@ install_ubuntu() {
     libtool \
     vim \
     unzip \
-    gdb
+    gpg-agent \
+    gdb \
+    bc
 
   # Should resolve issues related to various apt package repository cert issues
   # see: https://github.com/pytorch/pytorch/issues/65931
@@ -112,7 +118,6 @@ install_centos() {
     glibc-devel \
     glibc-headers \
     glog-devel \
-    hiredis-devel \
     libstdc++-devel \
     libsndfile-devel \
     make \
@@ -152,7 +157,7 @@ wget https://ossci-linux.s3.amazonaws.com/valgrind-${VALGRIND_VERSION}.tar.bz2
 tar -xjf valgrind-${VALGRIND_VERSION}.tar.bz2
 cd valgrind-${VALGRIND_VERSION}
 ./configure --prefix=/usr/local
-make -j6
+make -j$[$(nproc) - 2]
 sudo make install
 cd ../../
 rm -rf valgrind_build

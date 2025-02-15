@@ -1,8 +1,10 @@
+# mypy: allow-untyped-defs
 import torch
-from torch import nan
+from torch import nan, Tensor
 from torch.distributions import constraints
 from torch.distributions.distribution import Distribution
 from torch.distributions.utils import lazy_property, logits_to_probs, probs_to_logits
+
 
 __all__ = ["Categorical"]
 
@@ -36,7 +38,7 @@ class Categorical(Distribution):
 
     Example::
 
-        >>> # xdoctest: +IGNORE_WANT("non-deterinistic")
+        >>> # xdoctest: +IGNORE_WANT("non-deterministic")
         >>> m = Categorical(torch.tensor([ 0.25, 0.25, 0.25, 0.25 ]))
         >>> m.sample()  # equal probability of 0, 1, 2, 3
         tensor(3)
@@ -92,19 +94,19 @@ class Categorical(Distribution):
         return constraints.integer_interval(0, self._num_events - 1)
 
     @lazy_property
-    def logits(self):
+    def logits(self) -> Tensor:
         return probs_to_logits(self.probs)
 
     @lazy_property
-    def probs(self):
+    def probs(self) -> Tensor:
         return logits_to_probs(self.logits)
 
     @property
-    def param_shape(self):
+    def param_shape(self) -> torch.Size:
         return self._param.size()
 
     @property
-    def mean(self):
+    def mean(self) -> Tensor:
         return torch.full(
             self._extended_shape(),
             nan,
@@ -113,11 +115,11 @@ class Categorical(Distribution):
         )
 
     @property
-    def mode(self):
-        return self.probs.argmax(axis=-1)
+    def mode(self) -> Tensor:
+        return self.probs.argmax(dim=-1)
 
     @property
-    def variance(self):
+    def variance(self) -> Tensor:
         return torch.full(
             self._extended_shape(),
             nan,

@@ -8,12 +8,12 @@
 namespace torch::dynamo::autograd {
 class CompiledNodeArgs;
 class SwapSavedVariables;
+struct PackedArgs;
 } // namespace torch::dynamo::autograd
 
 // A hook that's called on gradients
 
-namespace torch {
-namespace autograd {
+namespace torch::autograd {
 
 using Variable = at::Tensor;
 using variable_list = std::vector<Variable>;
@@ -42,5 +42,24 @@ struct TORCH_API FunctionPostHook {
   }
 };
 
-} // namespace autograd
-} // namespace torch
+struct TORCH_API PostAccumulateGradHook {
+  virtual ~PostAccumulateGradHook() = default;
+  virtual void operator()(const Variable& tensor) = 0;
+  // only implemented for python hooks on nodes, registers hook with compiled
+  // autograd
+  virtual void compiled_args(torch::dynamo::autograd::CompiledNodeArgs& args) {
+    throw std::runtime_error(
+        std::string("not yet implemented for compiled autograd: ") +
+        typeid(*this).name());
+  }
+
+  virtual void apply_with_saved(
+      Variable&,
+      torch::dynamo::autograd::SwapSavedVariables&) {
+    throw std::runtime_error(
+        std::string("not yet implemented for compiled autograd: ") +
+        typeid(*this).name());
+  }
+};
+
+} // namespace torch::autograd

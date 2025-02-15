@@ -1,6 +1,6 @@
-from numbers import Number
-
+# mypy: allow-untyped-defs
 import torch
+from torch import Tensor
 from torch.distributions import constraints
 from torch.distributions.distribution import Distribution
 from torch.distributions.utils import (
@@ -10,6 +10,8 @@ from torch.distributions.utils import (
     probs_to_logits,
 )
 from torch.nn.functional import binary_cross_entropy_with_logits
+from torch.types import _Number
+
 
 __all__ = ["Geometric"]
 
@@ -18,14 +20,19 @@ class Geometric(Distribution):
     r"""
     Creates a Geometric distribution parameterized by :attr:`probs`,
     where :attr:`probs` is the probability of success of Bernoulli trials.
-    It represents the probability that in :math:`k + 1` Bernoulli trials, the
-    first :math:`k` trials failed, before seeing a success.
 
-    Samples are non-negative integers [0, :math:`\inf`).
+    .. math::
+
+        P(X=k) = (1-p)^{k} p, k = 0, 1, ...
+
+    .. note::
+        :func:`torch.distributions.geometric.Geometric` :math:`(k+1)`-th trial is the first success
+        hence draws samples in :math:`\{0, 1, \ldots\}`, whereas
+        :func:`torch.Tensor.geometric_` `k`-th trial is the first success hence draws samples in :math:`\{1, 2, \ldots\}`.
 
     Example::
 
-        >>> # xdoctest: +IGNORE_WANT("non-deterinistic")
+        >>> # xdoctest: +IGNORE_WANT("non-deterministic")
         >>> m = Geometric(torch.tensor([0.3]))
         >>> m.sample()  # underlying Bernoulli has 30% chance 1; 70% chance 0
         tensor([ 2.])
@@ -47,7 +54,7 @@ class Geometric(Distribution):
         else:
             (self.logits,) = broadcast_all(logits)
         probs_or_logits = probs if probs is not None else logits
-        if isinstance(probs_or_logits, Number):
+        if isinstance(probs_or_logits, _Number):
             batch_shape = torch.Size()
         else:
             batch_shape = probs_or_logits.size()
@@ -77,23 +84,23 @@ class Geometric(Distribution):
         return new
 
     @property
-    def mean(self):
+    def mean(self) -> Tensor:
         return 1.0 / self.probs - 1.0
 
     @property
-    def mode(self):
+    def mode(self) -> Tensor:
         return torch.zeros_like(self.probs)
 
     @property
-    def variance(self):
+    def variance(self) -> Tensor:
         return (1.0 / self.probs - 1.0) / self.probs
 
     @lazy_property
-    def logits(self):
+    def logits(self) -> Tensor:
         return probs_to_logits(self.probs, is_binary=True)
 
     @lazy_property
-    def probs(self):
+    def probs(self) -> Tensor:
         return logits_to_probs(self.logits, is_binary=True)
 
     def sample(self, sample_shape=torch.Size()):

@@ -1,75 +1,8 @@
-from typing import List, Optional
+# mypy: allow-untyped-defs
 
-import torch
-from torch.ao.quantization.quantizer.quantizer import (
-    QuantizationAnnotation,
-    QuantizationConfig,
-    QuantizationSpec,
-)
+from torch.ao.quantization.pt2e.utils import _is_sym_size_node
+from torch.ao.quantization.quantizer.quantizer import QuantizationAnnotation
 from torch.fx import Node
-
-__all__ = [
-    "get_input_act_qspec",
-    "get_output_act_qspec",
-    "get_weight_qspec",
-    "get_bias_qspec",
-]
-
-
-def get_input_act_qspec(quantization_config: Optional[QuantizationConfig]):
-    if quantization_config is None:
-        return None
-    if quantization_config.input_activation is None:
-        return None
-    quantization_spec: QuantizationSpec = quantization_config.input_activation
-    assert quantization_spec.qscheme in [
-        torch.per_tensor_affine,
-        torch.per_tensor_symmetric,
-    ]
-    return quantization_spec
-
-
-def get_output_act_qspec(quantization_config: Optional[QuantizationConfig]):
-    if quantization_config is None:
-        return None
-    if quantization_config.output_activation is None:
-        return None
-    quantization_spec: QuantizationSpec = quantization_config.output_activation
-    assert quantization_spec.qscheme in [
-        torch.per_tensor_affine,
-        torch.per_tensor_symmetric,
-    ]
-    return quantization_spec
-
-
-def get_weight_qspec(quantization_config: Optional[QuantizationConfig]):
-    if quantization_config is None:
-        return None
-    assert quantization_config is not None
-    if quantization_config.weight is None:
-        return None
-    quantization_spec: QuantizationSpec = quantization_config.weight
-    if quantization_spec.qscheme not in [
-        torch.per_tensor_symmetric,
-        torch.per_channel_symmetric,
-    ]:
-        raise ValueError(
-            f"Unsupported quantization_spec {quantization_spec} for weight"
-        )
-    return quantization_spec
-
-
-def get_bias_qspec(quantization_config: Optional[QuantizationConfig]):
-    if quantization_config is None:
-        return None
-    assert quantization_config is not None
-    if quantization_config.bias is None:
-        return None
-    quantization_spec: QuantizationSpec = quantization_config.bias
-    assert (
-        quantization_spec.dtype == torch.float
-    ), "Only float dtype for bias is supported for bias right now"
-    return quantization_spec
 
 
 def _annotate_input_qspec_map(node: Node, input_node: Node, qspec):
@@ -90,17 +23,7 @@ def _annotate_output_qspec(node: Node, qspec):
     node.meta["quantization_annotation"] = quantization_annotation
 
 
-def _is_sym_size_node(node: Node):
-    return (
-        node.op == "call_function"
-        and node.target == torch.ops.aten.sym_size.default
-        or node.target == torch.ops.aten.sym_numel.default
-        or node.target == torch.ops.aten.sym_numel
-        or node.target == torch.ops.aten.sym_size
-    )
-
-
-def _node_only_used_for_sym_size(node: Node, partition_nodes: List[Node]):
+def _node_only_used_for_sym_size(node: Node, partition_nodes: list[Node]):
     """
     This utility is used to handle cases when dynami_shape=True tracing leads
     to symint nodes in the pattern of linear module. In those cases, we need to
@@ -123,3 +46,37 @@ def _node_only_used_for_sym_size(node: Node, partition_nodes: List[Node]):
         ((user not in partition_nodes) or _is_sym_size_node(user))
         for user in node.users
     )
+
+
+def _get_module_name_filter(module_name: str):
+    """Get the module_name_filter function for a given module name, the filter accepts
+    a node and checks if the node comes from a module that has certain module name
+
+    For example:
+        node: linear_op = call_function[...](...)  # comes from a module with name blocks.sub.linear1
+
+
+    >> module_name_filter = _get_module_name_filter("blocks.sub")
+    >> print(module_name_filter(node))
+    True  # the node is from "blocks.sub" based on the fully qualified name "blocks.sub.linear1"
+    """
+
+    def module_name_filter(n: Node) -> bool:
+        # example: {
+        #    'L__self___sub': ("L['self'].sub", <class '....Sub'>),
+        #    'L__self___sub_linear': ("L['self'].sub.linear", <class 'torch.nn.modules.linear.Linear'>)
+        # }
+        # get_attr nodes doesn't have nn_module_stack?
+        nn_module_stack = n.meta.get("nn_module_stack", {})
+
+        def _normalize_path(n):
+            prefix = 0
+            # TODO This is non standard behavior and should be removed when we migrate off capture_pre_autograd_graph.
+            if n.startswith("L['self']."):
+                prefix = len("L['self'].")
+            return n[prefix:]
+
+        names = [_normalize_path(n) for n, _ in nn_module_stack.values()]
+        return module_name in names
+
+    return module_name_filter

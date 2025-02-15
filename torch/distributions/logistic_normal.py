@@ -1,7 +1,10 @@
+# mypy: allow-untyped-defs
+from torch import Tensor
 from torch.distributions import constraints
 from torch.distributions.normal import Normal
 from torch.distributions.transformed_distribution import TransformedDistribution
 from torch.distributions.transforms import StickBreakingTransform
+
 
 __all__ = ["LogisticNormal"]
 
@@ -23,7 +26,7 @@ class LogisticNormal(TransformedDistribution):
 
         >>> # logistic-normal distributed with mean=(0, 0, 0) and stddev=(1, 1, 1)
         >>> # of the base Normal distribution
-        >>> # xdoctest: +IGNORE_WANT("non-deterinistic")
+        >>> # xdoctest: +IGNORE_WANT("non-deterministic")
         >>> m = LogisticNormal(torch.tensor([0.0] * 3), torch.tensor([1.0] * 3))
         >>> m.sample()
         tensor([ 0.7653,  0.0341,  0.0579,  0.1427])
@@ -46,9 +49,9 @@ class LogisticNormal(TransformedDistribution):
         return super().expand(batch_shape, _instance=new)
 
     @property
-    def loc(self):
+    def loc(self) -> Tensor:
         return self.base_dist.base_dist.loc
 
     @property
-    def scale(self):
+    def scale(self) -> Tensor:
         return self.base_dist.base_dist.scale

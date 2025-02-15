@@ -1,3 +1,4 @@
+# mypy: allow-untyped-defs
 """
 This closely follows the implementation in NumPyro (https://github.com/pyro-ppl/numpyro).
 
@@ -13,6 +14,7 @@ import torch
 from torch.distributions import Beta, constraints
 from torch.distributions.distribution import Distribution
 from torch.distributions.utils import broadcast_all
+
 
 __all__ = ["LKJCholesky"]
 
@@ -37,7 +39,7 @@ class LKJCholesky(Distribution):
 
     Example::
 
-        >>> # xdoctest: +IGNORE_WANT("non-deterinistic")
+        >>> # xdoctest: +IGNORE_WANT("non-deterministic")
         >>> l = LKJCholesky(3, 0.5)
         >>> l.sample()  # l @ l.T is a sample of a correlation 3x3 matrix
         tensor([[ 1.0000,  0.0000,  0.0000],
